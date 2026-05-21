@@ -13,10 +13,9 @@ const {
   setCurrentBotId,
   initAutoRotation,
   setEnvBotName,
-  resolveLoginCookies,
 } = require('./bot_rotation');
 
-const { connectDB, getBots } = require('./database');
+const { connectDB, getBots, getBotConfig, setBotConfig } = require('./database');
 const { handleBotJoin, handleAdminGranted: _adminJoin } = require('./dukhul');
 const {
   handleAdminGranted, handleAdminCommand, handleProtection,
@@ -43,15 +42,6 @@ const {
   getDisabledCmdSession, setDisabledCmdSession, deleteDisabledCmdSession,
   addCommandWatcher, getJoinSession, getNashrSession
 } = require('./database');
-
-// دمج دوال دار الألعاب المتكاملة
-const {
-  handleDarAlal3abMenu,
-  handleDarAlal3abSession,
-  handleActiveGameInput,
-  handleGameInvitationReply,
-  handleTugOfWarReply
-} = require('./dar_alal3ab');
 
 // ===== نظام السجلات المفصّل =====
 function log(level, msg, extra) {
@@ -102,7 +92,7 @@ const server = http.createServer((req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   log('OK', `خادم الصحة يعمل على البورت ${PORT} — /health`);
 });
 
@@ -110,13 +100,6 @@ server.listen(PORT, () => {
 process.on('uncaughtException', (err) => {
   botStatus.lastError = `uncaughtException: ${err.message}`;
   log('FATAL', 'خطأ غير متوقع (uncaughtException):', err);
-
-  // خطأ المنفذ مشغول لا علاقة له بالبوت — لا نُعيد تشغيل startBot
-  if (err.code === 'EADDRINUSE') {
-    log('WARN', `⚠️ المنفذ ${PORT} مشغول بعملية أخرى — البوت سيستمر بدون خادم HTTP`);
-    return;
-  }
-
   log('WARN', 'سيتم إعادة التشغيل خلال 5 ثوانٍ...');
   botStatus.running = false;
   setTimeout(() => startBot(), 5000);
@@ -210,6 +193,76 @@ function getKingdomGroups() {
   return Object.values(config.groupes).map(String);
 }
 
+// ===== تجميع حسابات تسجيل الدخول والترتيب الفعلي للتشغيل =====
+async function getLoginCandidates() {
+  const candidates = [];
+
+  // قراءة الحساب المحدد يدوياً (إن وُجد)
+  let activeBotId = null;
+  try {
+    activeBotId = await getBotConfig('activeBotId');
+  } catch (e) {}
+
+  // 1. إذا كان المختار هو حساب المتغير البيئي، يُقدَّم أولاً فوراً
+  if (activeBotId === 'ENV') {
+    const envCookiesStr = process.env.APPSTATE || process.env.COOKIES;
+    if (envCookiesStr) {
+      try {
+        candidates.push({
+          source: 'env',
+          botId: null,
+          botName: 'حساب المتغير البيئي (APPSTATE)',
+          cookies: JSON.parse(envCookiesStr),
+        });
+      } catch (e) {
+        log('ERROR', 'خطأ في قراءة كوكيز المتغير البيئي APPSTATE:', e.message);
+      }
+    }
+  }
+
+  // 2. حسابات قاعدة البيانات — المحدد يدوياً أولاً، ثم النشط، ثم الباقون
+  try {
+    const bots = await getBots();
+    const sorted = [...bots].sort((a, b) => {
+      const aChosen = activeBotId && String(a._id) === String(activeBotId) ? 0 : 1;
+      const bChosen = activeBotId && String(b._id) === String(activeBotId) ? 0 : 1;
+      if (aChosen !== bChosen) return aChosen - bChosen;
+      const aFailed = a.status === 'failed' ? 1 : 0;
+      const bFailed = b.status === 'failed' ? 1 : 0;
+      return aFailed - bFailed;
+    });
+
+    for (const b of sorted) {
+      candidates.push({
+        source: 'db',
+        botId: String(b._id),
+        botName: b.name,
+        cookies: typeof b.cookies === 'string' ? JSON.parse(b.cookies) : b.cookies,
+      });
+    }
+  } catch (e) {
+    log('ERROR', 'خطأ في جلب حسابات قاعدة البيانات:', e.message);
+  }
+
+  // 3. كوكيز المتغير البيئي كخيار احتياطي أخير (إذا لم يُضَف مسبقاً)
+  if (activeBotId !== 'ENV') {
+    const envCookiesStr = process.env.APPSTATE || process.env.COOKIES;
+    if (envCookiesStr) {
+      try {
+        candidates.push({
+          source: 'env',
+          botId: null,
+          botName: 'حساب المتغير البيئي (APPSTATE)',
+          cookies: JSON.parse(envCookiesStr),
+        });
+      } catch (e) {
+        log('ERROR', 'خطأ في قراءة كوكيز المتغير البيئي APPSTATE:', e.message);
+      }
+    }
+  }
+
+  return candidates;
+}
 
 // دالة محاولة تسجيل الدخول كـ Promise
 function tryLogin(cookies) {
@@ -221,87 +274,60 @@ function tryLogin(cookies) {
   });
 }
 
-// مؤقت إنهاء التحديات تلقائياً لعدم الرد بعد دقيقة واحدة
-function startGameTimeoutWatcher(api) {
-  setInterval(async () => {
-    try {
-      const { getDB, getPlayer, updatePlayer } = require('./database');
-      const db = getDB();
-      const cutoff = new Date(Date.now() - 60 * 1000); // دقيقة واحدة
-
-      const timedOutGames = await db.collection('active_game_sessions').find({
-        mode: 'challenge',
-        status: 'active',
-        lastActivity: { $lt: cutoff }
-      }).toArray();
-
-      for (const game of timedOutGames) {
-        await db.collection('active_game_sessions').deleteOne({ _id: game._id });
-
-        const inactivePlayerId = game.turn;
-        const activePlayerId = game.players.find(p => p !== inactivePlayerId);
-        
-        const winnerName = game.playerNames[activePlayerId];
-        const loserName = game.playerNames[inactivePlayerId];
-
-        // تعويض الفائز بالرهان المالي المزدوج
-        if (game.bet > 0) {
-          const winnerDoc = await getPlayer(activePlayerId);
-          await updatePlayer(activePlayerId, { coins: (winnerDoc.coins || 0) + (game.bet * 2) });
-        }
-
-        const alertMsg = `⏱️ انتهت مهلة الانتظار (1 دقيقة) دون رد من اللاعب ⟦ ${loserName} ⟧!\n🏆 تم إعلان اللاعب ⟦ ${winnerName} ⟧ فائزاً بالمباراة بالانسحاب وحصل على قيمة الرهان كاملاً!`;
-        
-        await sendMessage(api, alertMsg, game.playerThreads[activePlayerId]);
-        if (game.playerThreads[activePlayerId] !== game.playerThreads[inactivePlayerId]) {
-          await sendMessage(api, alertMsg, game.playerThreads[inactivePlayerId]);
-        }
-      }
-    } catch (err) {
-      console.error('[GameWatcher] خطأ أثناء معالجة مهلة وقت الألعاب:', err);
-    }
-  }, 15000); // فحص مستمر كل 15 ثانية
-}
-
-// ===== دالة تشغيل البوت =====
+// ===== دالة تشغيل البوت والتحقق المتسلسل من الحسابات =====
 async function startBot() {
   stopCurrentListener();
   botStatus.restartCount++;
 
-  log('INFO', '🔄 جاري تحديد الحساب المطلوب من قاعدة البيانات...');
-  const loginData = await resolveLoginCookies();
+  log('INFO', '🔄 جاري تحضير مرشحي كوكيز تسجيل الدخول...');
+  const candidates = await getLoginCandidates();
 
-  if (!loginData) {
-    log('FATAL', '🔒 لا توجد كوكيزات متاحة — تحقق من قاعدة البيانات أو المتغير البيئي.');
+  if (candidates.length === 0) {
+    log('FATAL', '🔒 لا توجد كوكيزات متاحة في قاعدة البيانات ولا في المتغير البيئي.');
     botStatus.lastError = 'لا تتوفر أي حسابات';
     botStatus.running = false;
     return;
   }
 
-  log('INFO', `🔑 جاري تسجيل الدخول بالحساب: [${loginData.botName}]`);
-  let api;
-  try {
-    api = await tryLogin(loginData.cookies);
-  } catch (err) {
-    const errMsg = err.error || err.message || JSON.stringify(err);
-    log('ERROR', `❌ فشل تسجيل الدخول للحساب [${loginData.botName}]: ${errMsg}`);
-    if (loginData.botId) {
-      await markBotFailed(loginData.botId).catch(() => {});
+  let successfulApi = null;
+  let loggedInAccount = null;
+
+  // فحص الحسابات بالتتالي (حساب واحد لكل محاولة دون تكرار لانهائي)
+  for (const candidate of candidates) {
+    log('INFO', `🔑 جاري محاولة تسجيل الدخول بالحساب: [${candidate.botName}]`);
+    try {
+      successfulApi = await tryLogin(candidate.cookies);
+      loggedInAccount = candidate;
+      break; // نجاح تسجيل الدخول، نخرج من حلقة الفحص
+    } catch (err) {
+      const errMsg = err.error || err.message || JSON.stringify(err);
+      log('ERROR', `❌ فشل تسجيل الدخول للحساب [${candidate.botName}]: ${errMsg}`);
+
+      if (candidate.source === 'db' && candidate.botId) {
+        await markBotFailed(candidate.botId).catch(() => {});
+      }
     }
-    log('WARN', '🔄 جاري المحاولة بالحساب التالي خلال 3 ثوانٍ...');
-    botStatus.lastError = `فشل تسجيل الدخول: ${errMsg}`;
+  }
+
+  // إذا لم ينجح أي حساب على الإطلاق، يتوقف البوت تماماً
+  if (!successfulApi || !loggedInAccount) {
+    log('FATAL', '🔒 [فشلت جميع الكوكيزات، في انتظار التحديث] — لن تتم إعادة المحاولة تلقائياً حتى يقوم المطور بتحديث الكوكيز.');
+    botStatus.lastError = 'فشلت جميع الكوكيزات، في انتظار التحديث';
     botStatus.running = false;
-    setTimeout(() => startBot(), 3000);
     return;
   }
+
+  const api = successfulApi;
+  const loginData = loggedInAccount;
 
   setCurrentBotId(loginData.botId);
   botStatus.running = true;
   botStatus.loginTime = Date.now();
   lastEventTime = Date.now();
-  log('OK', `✅ تم تسجيل الدخول بنجاح — الحساب النشط: ${loginData.botName}`);
+  log('OK', `✅ تم تسجيل الدخول بنجاح — الحساب النشط الحالي: ${loginData.botName}`);
 
-  if (loginData.botId) {
+  // تحديث حالة الاستخدام في DB الحساب النشط
+  if (loginData.source === 'db' && loginData.botId) {
     try {
       const { ObjectId } = require('mongodb');
       const { getDB } = require('./database');
@@ -312,10 +338,26 @@ async function startBot() {
     } catch (e) {}
   } else {
     try {
-      const BOT_UID = String(api.getCurrentUserID());
-      await setEnvBotName(`المتغير البيئي (${BOT_UID})`);
+      const { getBotConfig: _gbc } = require('./database');
+      const saved = await _gbc('envBotName').catch(() => null);
+      if (!saved) {
+        const BOT_UID = String(api.getCurrentUserID());
+        await setEnvBotName(`المتغير البيئي (${BOT_UID})`);
+      }
     } catch (e) {}
   }
+
+  // إرسال إشعار إعادة التشغيل إن كان مطلوباً
+  try {
+    const notifyThread = await getBotConfig('restartNotifyThread').catch(() => null);
+    if (notifyThread) {
+      await setBotConfig('restartNotifyThread', null).catch(() => {});
+      await sendMessage(api,
+        `╮───∙⋆⋅「 تم إعادة التشغيل ✅️ 」\n│\n│ › الحساب النشط : ${loginData.botName}\n│\n╯───────∙⋆⋅ ※ ⋅⋆∙`,
+        notifyThread
+      ).catch(() => {});
+    }
+  } catch (e) {}
 
   const BOT_ID = String(api.getCurrentUserID());
   api.setOptions({ listenEvents: true, selfListen: false });
@@ -323,9 +365,6 @@ async function startBot() {
   // تهيئة مسابقة النشر والدعوات التلقائية
   const { initCompetitions } = require('./Mosaba9at');
   initCompetitions(api).catch(err => log('ERROR', 'خطأ في تهيئة المسابقات التلقائية:', err));
-
-  // بدء تشغيل مراقب وقت الألعاب (التحديات)
-  startGameTimeoutWatcher(api);
 
   startConversationCleanup();
   startWatchdog();
@@ -431,18 +470,6 @@ async function startBot() {
 
       if (!text) return;
 
-      // ── 1. تفاعل لعبة شد الحبل (الرد بكلمة شد) ──
-      const tugHandled = await handleTugOfWarReply(api, event);
-      if (tugHandled) return;
-
-      // ── 2. تفاعل الردود على دعوات الألعاب (قبول/رفض) ──
-      const inviteHandled = await handleGameInvitationReply(api, event);
-      if (inviteHandled) return;
-
-      // ── 3. تفاعل مدخلات اللعب النشط (الفردي والجماعي) ──
-      const gameActiveHandled = await handleActiveGameInput(api, event);
-      if (gameActiveHandled) return;
-
       if (text === 'ايدي') {
         const targetId = (event.messageReply && event.messageReply.senderID)
           ? String(event.messageReply.senderID)
@@ -473,7 +500,6 @@ async function startBot() {
         isDisabled,
         joinSession,
         nashrSession,
-        gameMenuSession, // جلب جلسة قائمة الألعاب النشطة
       ] = await Promise.all([
         getDisabledCmdSession(senderID),
         getTempSession(senderID),
@@ -483,7 +509,6 @@ async function startBot() {
         cmdKey ? isCommandDisabled(cmdKey) : Promise.resolve(false),
         getJoinSession(senderID),
         getNashrSession(senderID),
-        require('./database').getDB().collection('dar_alal3ab_sessions').findOne({ fbId: String(senderID) }),
       ]);
 
       if (disabledSession) {
@@ -533,12 +558,6 @@ async function startBot() {
       if (marketSession) { await handleMarketSession(api, event, marketSession); return; }
       if (nashrSession) { await handleNashrReply(api, event, nashrSession); return; }
 
-      // معالجة جلسات اختيار الألعاب
-      if (gameMenuSession) {
-        const handled = await handleDarAlal3abSession(api, event, gameMenuSession);
-        if (handled) return;
-      }
-
       const player = await getPlayer(senderID);
 
       if (isKingdomGroup && player && kingdom) {
@@ -548,12 +567,6 @@ async function startBot() {
 
       if (['اوامر','الاوامر','أوامر','الأوامر'].includes(text)) {
         await handleAwamer(api, event); return;
-      }
-
-      // === أمر فتح دار الألعاب ===
-      if (['العاب', 'ألعاب', 'دار الالعاب', 'دار الألعاب'].includes(text)) {
-        await handleDarAlal3abMenu(api, event);
-        return;
       }
 
       // === أوامر المسابقات الحالية ===
@@ -657,16 +670,8 @@ async function start() {
     log('ERROR', '⚠️ خطأ في تحميل بيانات الإدارة:', e.message);
   }
 
-  // دالة إعادة التشغيل الداخلية — تُوقف كل شيء وتبدأ startBot من جديد
-  // تُسجَّل في bot_rotation حتى يستطيع admin2.js استدعاءها
   await initAutoRotation(() => {
-    log('INFO', '🔄 [Restart] تم طلب إعادة التشغيل...');
-    botStatus.running = false;
-    if (watchdogInterval) { clearInterval(watchdogInterval); watchdogInterval = null; }
-    if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
-    currentApi = null;
-    stopCurrentListener();
-    setTimeout(() => startBot(), 1500);
+    startBot();
   });
 
   await startBot();

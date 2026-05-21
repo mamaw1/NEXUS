@@ -45,12 +45,10 @@ const {
   stopAutoRotation,
   isAutoRotateActive,
   switchToBot,
-  getCurrentBotId,
   getEnvCUser,
   getEnvCookies,
   getEnvBotName,
   setEnvBotName,
-  triggerRestart,
 } = require('./bot_rotation');
 
 const { handleManshourat, handleManshouraatSession } = require('./nashr');
@@ -139,26 +137,27 @@ async function buildBotaatMsg(bots) {
   const showEnv      = _envIsAlone(bots, envCUser);
   const envName      = showEnv ? await getEnvBotName() : null;
 
-  // المصدر الحقيقي: الذاكرة أولاً
-  const runningBotId = getCurrentBotId();
-  const currentId    = runningBotId || activeBotId;
-
   let msg = `╮───────∙⋆⋅ ※ ⋅⋆∙───────╭\n        ✦  البوتات  ✦\n╯───────∙⋆⋅ ※ ⋅⋆∙───────╰\n\n`;
   msg += `╮───∙⋆⋅「 القائمة 」\n│\n`;
 
+  const allBots = [...bots];
   let counter = 1;
 
-  bots.forEach(b => {
-    const isActive = currentId && currentId !== 'ENV' && String(b._id) === String(currentId);
-    const isFailed = b.status === 'failed';
+  // حسابات DB
+  allBots.forEach(b => {
+    const isActive   = activeBotId && String(b._id) === String(activeBotId);
+    const isFailed   = b.status === 'failed';
+    const cUser      = b.cookies && (b.cookies.find(x => x.key === 'c_user') || {}).value;
+    const isEnvMatch = cUser && String(cUser) === envCUser;
     let tag = '';
-    if (isActive)  tag = ' ✦ الحالي';
-    else if (isFailed) tag = ' ⛔ فشل';
+    if (isActive || isEnvMatch) tag = ' ✦ الحالي';
+    else if (isFailed)          tag = ' ⛔ فشل';
     msg += `│ ${counter++}. ${b.name}${tag}\n`;
   });
 
+  // حساب المتغير البيئي (إن لم يكن موجوداً في DB)
   if (showEnv) {
-    const isEnvActive = (!runningBotId && (!activeBotId || activeBotId === 'ENV')) || activeBotId === 'ENV';
+    const isEnvActive = (activeBotId === 'ENV');
     msg += `│ ${counter++}. ${envName}${isEnvActive ? ' ✦ الحالي' : ''} 📌\n`;
   }
 
@@ -331,25 +330,20 @@ async function handleBotaatSession(api, event, session) {
 async function handleTabdeel(api, event) {
   const { threadID, senderID } = event;
   const bots        = await getBots();
+  const activeBotId = await getBotConfig('activeBotId').catch(() => null);
   const autoEnabled = await getBotConfig('autoRotateEnabled').catch(() => false);
   const autoMinutes = await getBotConfig('autoRotateMinutes').catch(() => 0);
   const envCUser    = getEnvCUser();
   const showEnv     = _envIsAlone(bots, envCUser);
   const envName     = showEnv ? await getEnvBotName() : null;
 
-  // المصدر الحقيقي: الحساب الجاري فعلاً في الذاكرة
-  const runningBotId = getCurrentBotId(); // null = المتغير البيئي أو لم يُحدَّد بعد
-  const activeBotId  = await getBotConfig('activeBotId').catch(() => null);
-  // استخدام القيمة الأدق: الذاكرة أولاً، ثم DB
-  const currentId = runningBotId || activeBotId;
-
   let msg = `╮───────∙⋆⋅ ※ ⋅⋆∙───────╭\n      ✦  تبديل البوت  ✦\n╯───────∙⋆⋅ ※ ⋅⋆∙───────╰\n\n`;
   msg += `╮───∙⋆⋅「 البوتات 」\n│\n`;
 
   let counter = 1;
   bots.forEach(b => {
-    const isActive = currentId && currentId !== 'ENV' && String(b._id) === String(currentId);
-    const isFailed = b.status === 'failed';
+    const isActive  = activeBotId && String(b._id) === String(activeBotId);
+    const isFailed  = b.status === 'failed';
     let tag = '';
     if (isActive) tag = ' ✦ الحالي';
     else if (isFailed) tag = ' ⛔ فشل';
@@ -357,8 +351,7 @@ async function handleTabdeel(api, event) {
   });
 
   if (showEnv) {
-    // ENV نشط فقط إذا لا يوجد حساب DB جارٍ في الذاكرة
-    const isEnvActive = !runningBotId && (!activeBotId || activeBotId === 'ENV');
+    const isEnvActive = (activeBotId === 'ENV');
     msg += `│ ${counter++}. ${envName}${isEnvActive ? ' ✦ الحالي' : ''} 📌\n`;
   }
 
@@ -408,7 +401,9 @@ async function handleTabdeelSession(api, event, session) {
       await sendMessage(api, `⚠️ يجب وجود حسابين صالحين على الأقل للتبديل التلقائي`, threadID);
       return;
     }
-    await startAutoRotation(minutes, () => triggerRestart());
+    await startAutoRotation(minutes, () => {
+      setTimeout(() => process.exit(0), 1500);
+    });
     await deleteAdminSession(senderID);
     await sendMessage(api,
       `╮───∙⋆⋅「 التبديل التلقائي 」\n│\n│ › تم التفعيل 🟢\n│ › سيتم التبديل كل ${minutes} دقيقة\n│ › عدد الحسابات : ${active.length}\n╯───────∙⋆⋅ ※ ⋅⋆∙`,
@@ -425,45 +420,39 @@ async function handleTabdeelSession(api, event, session) {
   }
 
   const bot = bots[idx];
-
-  // المصدر الحقيقي للحساب الجاري
-  const runningBotId = getCurrentBotId();
-  const activeBotId  = await getBotConfig('activeBotId').catch(() => null);
+  const activeBotId = await getBotConfig('activeBotId').catch(() => null);
 
   // حساب المتغير البيئي (ENV)
   if (bot.isEnv) {
-    const isEnvRunning = !runningBotId && (!activeBotId || activeBotId === 'ENV');
-    if (isEnvRunning) {
+    if (activeBotId === 'ENV') {
       await deleteAdminSession(senderID);
       await sendMessage(api, `╮───∙⋆⋅「 تبديل 」\n│\n│ › ${bot.name} هو الحساب المستخدم حالياً ✦ 📌\n╯───────∙⋆⋅ ※ ⋅⋆∙`, threadID);
       return;
     }
-    // التبديل لحساب المتغير البيئي
+    // التبديل لحساب المتغير البيئي = sentinel 'ENV'
     await setBotConfig('activeBotId', 'ENV').catch(() => {});
-    await setBotConfig('restartNotifyThread', threadID);
+    await setBotConfig('restartNotifyThread', threadID).catch(() => {});
     await deleteAdminSession(senderID);
     await sendMessage(api,
       `╮───∙⋆⋅「 تبديل البوت 」\n│\n│ › تم الاختيار : ${bot.name} 📌\n│ › جارِ إعادة التشغيل... ⟳\n╯───────∙⋆⋅ ※ ⋅⋆∙`,
-      threadID);
-    setTimeout(() => triggerRestart(), 1500);
+      threadID).catch(() => {});
+    setTimeout(() => process.exit(0), 2000);
     return;
   }
 
-  // هل الحساب المختار هو نفسه الجاري فعلاً؟
-  const isAlreadyRunning = runningBotId && String(runningBotId) === String(bot._id);
-  if (isAlreadyRunning) {
+  if (activeBotId && String(activeBotId) === String(bot._id)) {
     await deleteAdminSession(senderID);
     await sendMessage(api, `╮───∙⋆⋅「 تبديل 」\n│\n│ › ${bot.name} هو الحساب المستخدم حالياً ✦\n╯───────∙⋆⋅ ※ ⋅⋆∙`, threadID);
     return;
   }
 
   await switchToBot(bot._id);
-  await setBotConfig('restartNotifyThread', threadID);
+  await setBotConfig('restartNotifyThread', threadID).catch(() => {});
   await deleteAdminSession(senderID);
   await sendMessage(api,
     `╮───∙⋆⋅「 تبديل البوت 」\n│\n│ › تم الاختيار : ${bot.name}\n│ › جارِ إعادة التشغيل... ⟳\n╯───────∙⋆⋅ ※ ⋅⋆∙`,
-    threadID);
-  setTimeout(() => triggerRestart(), 1500);
+    threadID).catch(() => {});
+  setTimeout(() => process.exit(0), 2000);
 }
 
 // ═════════════════════════════════════════════════════════════════════
