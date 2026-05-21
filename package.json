@@ -1,0 +1,13 @@
+{
+  "name": "nexus-bot",
+  "version": "1.0.0",
+  "description": "بوت نظام نيكسوس",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@dongdev/fca-unofficial": "^4.0.3",
+    "mongodb": "^6.21.0"
+  }
+}
